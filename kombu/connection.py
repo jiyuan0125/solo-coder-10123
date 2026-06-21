@@ -51,10 +51,87 @@ resolve_aliases = {
     'librabbitmq': 'amqp',
 }
 
-failover_strategies = {
+
+class FailoverStrategyRegistry(dict):
+    """可扩展的故障转移策略注册表。
+
+    继承 dict 协议，第三方代码可以像操作普通字典一样往里写条目。
+    同时提供 register() 方法用于显式注册。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._named = {}
+
+    def __getitem__(self, key):
+        if key in self._named:
+            return self._named[key]
+        return super().__getitem__(key)
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        if key in self._named:
+            del self._named[key]
+        if key in self:
+            super().__delitem__(key)
+
+    def __contains__(self, key):
+        if key in self._named:
+            return True
+        return super().__contains__(key)
+
+    def __iter__(self):
+        seen = set()
+        for k in self._named:
+            if k not in seen:
+                seen.add(k)
+                yield k
+        for k in super().__iter__():
+            if k not in seen:
+                seen.add(k)
+                yield k
+
+    def __len__(self):
+        return len(set(self._named.keys()) | set(super().__iter__()))
+
+    def register(self, name, strategy=None):
+        """注册一个故障转移策略。
+
+        可以用作装饰器：
+
+            @registry.register('custom')
+            def my_strategy(alt): ...
+
+        或者显式传入：
+            registry.register('custom', my_strategy)
+        """
+        if strategy is None:
+            def _decorator(fn):
+                self._named[name] = fn
+                return fn
+            return _decorator
+        self._named[name] = strategy
+        return strategy
+
+    def resolve(self, name_or_strategy):
+        """根据名字或策略实例解析出实际的策略函数。
+
+        优先从命名注册表找，找不到再从字典条目找，最后直接返回传入值本身。
+        保证第三方往老字典里塞的条目也能被识别。
+        """
+        if name_or_strategy in self._named:
+            return self._named[name_or_strategy]
+        if name_or_strategy in self:
+            return super().__getitem__(name_or_strategy)
+        return name_or_strategy
+
+
+failover_strategies = FailoverStrategyRegistry({
     'round-robin': roundrobin_failover,
     'shuffle': shufflecycle,
-}
+})
 
 _log_connection = os.environ.get('KOMBU_LOG_CONNECTION', False)
 _log_channel = os.environ.get('KOMBU_LOG_CHANNEL', False)
@@ -232,8 +309,8 @@ class Connection:
         # only temporary solution as this won't work when
         # passing a custom object (Issue celery/celery#3320).
         self._failover_strategy = failover_strategy or 'round-robin'
-        self.failover_strategy = self.failover_strategies.get(
-            self._failover_strategy) or self._failover_strategy
+        self.failover_strategy = self.failover_strategies.resolve(
+            self._failover_strategy)
         if self.alt:
             self.cycle = self.failover_strategy(self.alt)
             next(self.cycle)  # skip first entry
@@ -505,7 +582,11 @@ class Connection:
 
     def completes_cycle(self, retries):
         """Return true if the cycle is complete after number of `retries`."""
-        return not (retries + 1) % len(self.alt) if self.alt else True
+        if not self.alt:
+            return True
+        if len(self.alt) <= 1:
+            return True
+        return not (retries + 1) % len(self.alt)
 
     def revive(self, new_channel):
         """Revive connection after connection re-established."""
@@ -646,12 +727,28 @@ class Connection:
         channels = [channel]
 
         class Revival:
-            __name__ = getattr(fun, '__name__', None)
-            __module__ = getattr(fun, '__module__', None)
-            __doc__ = getattr(fun, '__doc__', None)
 
             def __init__(self, connection):
                 self.connection = connection
+                self._update_metadata(fun)
+
+            def _update_metadata(self, f):
+                try:
+                    self.__name__ = getattr(f, '__name__', None)
+                except (AttributeError, TypeError):
+                    pass
+                try:
+                    self.__module__ = getattr(f, '__module__', None)
+                except (AttributeError, TypeError):
+                    pass
+                try:
+                    self.__doc__ = getattr(f, '__doc__', None)
+                except (AttributeError, TypeError):
+                    pass
+                try:
+                    self.__qualname__ = getattr(f, '__qualname__', None)
+                except (AttributeError, TypeError):
+                    pass
 
             def revive(self, channel):
                 channels[0] = channel
@@ -699,10 +796,13 @@ class Connection:
         if self.uri_prefix:
             hostname = f'{self.uri_prefix}+{hostname}'
 
+        # password 不调用 callable，保持原样透传
+        raw_password = self.password
+
         info = (
             ('hostname', hostname),
             ('userid', self.userid or D.get('userid')),
-            ('password', self.password or D.get('password')),
+            ('password', raw_password if raw_password is not None else D.get('password')),
             ('virtual_host', self.virtual_host or D.get('virtual_host')),
             ('port', self.port or D.get('port')),
             ('insist', self.insist),
@@ -751,6 +851,7 @@ class Connection:
             if not include_password:
                 connection_as_uri = maybe_sanitize_url(connection_as_uri)
             return connection_as_uri
+        # 不能 parse url 的才走本地拼接
         fields = self.info()
         port, userid, password, vhost, transport = getfields(fields)
         if not include_password:
@@ -899,7 +1000,10 @@ class Connection:
         return self.clone()
 
     def __reduce__(self):
-        return self.__class__, tuple(self.info().values()), None
+        # pickle 走构造器参数，不是实例字典
+        # 注册表里只塞了实例没给名字时，反序列化时落到默认 round-robin
+        info_dict = dict(self._info(resolve=False))
+        return self.__class__, tuple(info_dict.values()), None
 
     def __enter__(self):
         return self
