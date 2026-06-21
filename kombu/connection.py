@@ -57,11 +57,28 @@ class FailoverStrategyRegistry(dict):
 
     继承 dict 协议，第三方代码可以像操作普通字典一样往里写条目。
     同时提供 register() 方法用于显式注册。
+
+    keys() / values() / items() 合并 _named 和底层 dict 并去重，
+    与 __iter__ / __len__ 的去重逻辑一致。
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, fallback_dict=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._named = {}
+        self.fallback_dict = fallback_dict
+
+    def _merged_keys(self):
+        seen = set()
+        result = []
+        for k in self._named:
+            if k not in seen:
+                seen.add(k)
+                result.append(k)
+        for k in super().__iter__():
+            if k not in seen:
+                seen.add(k)
+                result.append(k)
+        return result
 
     def __getitem__(self, key):
         if key in self._named:
@@ -70,6 +87,11 @@ class FailoverStrategyRegistry(dict):
 
     def __setitem__(self, key, value):
         super().__setitem__(key, value)
+        if self.fallback_dict is not None:
+            try:
+                self.fallback_dict[key] = value
+            except TypeError:
+                pass
 
     def __delitem__(self, key):
         if key in self._named:
@@ -83,21 +105,39 @@ class FailoverStrategyRegistry(dict):
         return super().__contains__(key)
 
     def __iter__(self):
-        seen = set()
-        for k in self._named:
-            if k not in seen:
-                seen.add(k)
-                yield k
-        for k in super().__iter__():
-            if k not in seen:
-                seen.add(k)
-                yield k
+        return iter(self._merged_keys())
 
     def __len__(self):
         return len(set(self._named.keys()) | set(super().__iter__()))
 
+    def keys(self):
+        return self._merged_keys()
+
+    def values(self):
+        return [self[k] for k in self._merged_keys()]
+
+    def items(self):
+        return [(k, self[k]) for k in self._merged_keys()]
+
+    def get(self, key, default=None):
+        if key in self._named:
+            return self._named[key]
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        if self.fallback_dict is not None:
+            try:
+                value = self.fallback_dict[key]
+            except (KeyError, TypeError):
+                pass
+            else:
+                super().__setitem__(key, value)
+                return value
+        return default
+
     def register(self, name, strategy=None):
         """注册一个故障转移策略。
+
+        只写主表 _named，不碰 fallback_dict。
 
         可以用作装饰器：
 
@@ -118,13 +158,24 @@ class FailoverStrategyRegistry(dict):
     def resolve(self, name_or_strategy):
         """根据名字或策略实例解析出实际的策略函数。
 
-        优先从命名注册表找，找不到再从字典条目找，最后直接返回传入值本身。
+        优先从命名注册表找，再从主表找，再从 fallback_dict 回退，
+        最后判断是否为 callable 直接当作策略使用。
         保证第三方往老字典里塞的条目也能被识别。
         """
         if name_or_strategy in self._named:
             return self._named[name_or_strategy]
-        if name_or_strategy in self:
+        if super().__contains__(name_or_strategy):
             return super().__getitem__(name_or_strategy)
+        if self.fallback_dict is not None:
+            try:
+                value = self.fallback_dict[name_or_strategy]
+            except (KeyError, TypeError):
+                pass
+            else:
+                super().__setitem__(name_or_strategy, value)
+                return value
+        if callable(name_or_strategy):
+            return name_or_strategy
         return name_or_strategy
 
 
@@ -135,6 +186,109 @@ failover_strategies = FailoverStrategyRegistry({
 
 _log_connection = os.environ.get('KOMBU_LOG_CONNECTION', False)
 _log_channel = os.environ.get('KOMBU_LOG_CHANNEL', False)
+
+
+class RetryOrchestrator:
+    """独立的重试编排组件。
+
+    将 ensure / _ensure_connection 中的重试循环和异常分类逻辑
+    从 Connection 中抽离出来，让 Connection 只负责转调。
+    """
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def ensure_connection(
+        self, errback=None, max_retries=None,
+        interval_start=2, interval_step=2, interval_max=30,
+        callback=None, reraise_as_library_errors=True,
+        timeout=None
+    ):
+        conn = self.connection
+        if conn.connected:
+            return conn._connection
+
+        def on_error(exc, intervals, retries, interval=0):
+            round = conn.completes_cycle(retries)
+            if round:
+                interval = next(intervals)
+            try:
+                if errback:
+                    errback(exc, interval)
+            finally:
+                conn.maybe_switch_next()
+            return interval if round else 0
+
+        ctx = conn._reraise_as_library_errors
+        if not reraise_as_library_errors:
+            ctx = conn._dummy_context
+        with ctx():
+            return retry_over_time(
+                conn._connection_factory,
+                conn.recoverable_connection_errors,
+                (), {}, on_error, max_retries,
+                interval_start, interval_step, interval_max,
+                callback, timeout=timeout
+            )
+
+    def ensure(self, obj, fun, errback=None, max_retries=None,
+               interval_start=1, interval_step=1, interval_max=1,
+               on_revive=None, retry_errors=None):
+        if retry_errors is None:
+            retry_errors = tuple()
+
+        conn = self.connection
+
+        def _ensured(*args, **kwargs):
+            got_connection = 0
+            conn_errors = conn.recoverable_connection_errors
+            chan_errors = conn.recoverable_channel_errors
+            has_modern_errors = hasattr(
+                conn.transport, 'recoverable_connection_errors',
+            )
+            with conn._reraise_as_library_errors():
+                for retries in count(0):
+                    try:
+                        return fun(*args, **kwargs)
+                    except retry_errors as exc:
+                        if max_retries is not None and retries >= max_retries:
+                            raise
+                        conn._debug('ensure retry policy error: %r',
+                                    exc, exc_info=1)
+                    except conn_errors as exc:
+                        conn.maybe_switch_next()
+                        if got_connection and not has_modern_errors:
+                            raise
+                        if max_retries is not None and retries >= max_retries:
+                            raise
+                        conn._debug('ensure connection error: %r',
+                                    exc, exc_info=1)
+                        conn.collect()
+                        errback and errback(exc, 0)
+                        remaining_retries = None
+                        if max_retries is not None:
+                            remaining_retries = max(max_retries - retries, 1)
+                        conn._ensure_connection(
+                            errback,
+                            remaining_retries,
+                            interval_start, interval_step, interval_max,
+                            reraise_as_library_errors=False,
+                        )
+                        channel = conn.default_channel
+                        obj.revive(channel)
+                        if on_revive:
+                            on_revive(channel)
+                        got_connection += 1
+                    except chan_errors as exc:
+                        if max_retries is not None and retries > max_retries:
+                            raise
+                        conn._debug('ensure channel error: %r',
+                                    exc, exc_info=1)
+                        errback and errback(exc, 0)
+        _ensured.__name__ = f'{fun.__name__}(ensured)'
+        _ensured.__doc__ = fun.__doc__
+        _ensured.__module__ = fun.__module__
+        return _ensured
 
 
 class Connection:
@@ -326,6 +480,7 @@ class Connection:
             self.uri_prefix = uri_prefix
 
         self.declared_entities = set()
+        self._retry_orchestrator = RetryOrchestrator(self)
 
     def switch(self, conn_str):
         """Switch connection parameters to use a new URL or hostname.
@@ -533,34 +688,13 @@ class Connection:
             timeout (int): Maximum amount of time in seconds to spend
                 attempting to connect, total over all retries.
         """
-        if self.connected:
-            return self._connection
-
-        def on_error(exc, intervals, retries, interval=0):
-            round = self.completes_cycle(retries)
-            if round:
-                interval = next(intervals)
-            try:
-                if errback:
-                    errback(exc, interval)
-            finally:
-                # Select next host after invoking errback so that the
-                # callback can inspect the failing host, but always
-                # switch even if errback raises.
-                self.maybe_switch_next()
-
-            return interval if round else 0
-
-        ctx = self._reraise_as_library_errors
-        if not reraise_as_library_errors:
-            ctx = self._dummy_context
-        with ctx():
-            return retry_over_time(
-                self._connection_factory, self.recoverable_connection_errors,
-                (), {}, on_error, max_retries,
-                interval_start, interval_step, interval_max,
-                callback, timeout=timeout
-            )
+        return self._retry_orchestrator.ensure_connection(
+            errback=errback, max_retries=max_retries,
+            interval_start=interval_start, interval_step=interval_step,
+            interval_max=interval_max, callback=callback,
+            reraise_as_library_errors=reraise_as_library_errors,
+            timeout=timeout,
+        )
 
     @contextmanager
     def _reraise_as_library_errors(
@@ -643,63 +777,12 @@ class Connection:
             ...                       errback=errback, max_retries=3)
             >>> publish({'hello': 'world'}, routing_key='dest')
         """
-        if retry_errors is None:
-            retry_errors = tuple()
-
-        def _ensured(*args, **kwargs):
-            got_connection = 0
-            conn_errors = self.recoverable_connection_errors
-            chan_errors = self.recoverable_channel_errors
-            has_modern_errors = hasattr(
-                self.transport, 'recoverable_connection_errors',
-            )
-            with self._reraise_as_library_errors():
-                for retries in count(0):  # for infinity
-                    try:
-                        return fun(*args, **kwargs)
-                    except retry_errors as exc:
-                        if max_retries is not None and retries >= max_retries:
-                            raise
-                        self._debug('ensure retry policy error: %r',
-                                    exc, exc_info=1)
-                    except conn_errors as exc:
-                        self.maybe_switch_next()  # select next host
-                        if got_connection and not has_modern_errors:
-                            # transport can not distinguish between
-                            # recoverable/irrecoverable errors, so we propagate
-                            # the error if it persists after a new connection
-                            # was successfully established.
-                            raise
-                        if max_retries is not None and retries >= max_retries:
-                            raise
-                        self._debug('ensure connection error: %r',
-                                    exc, exc_info=1)
-                        self.collect()
-                        errback and errback(exc, 0)
-                        remaining_retries = None
-                        if max_retries is not None:
-                            remaining_retries = max(max_retries - retries, 1)
-                        self._ensure_connection(
-                            errback,
-                            remaining_retries,
-                            interval_start, interval_step, interval_max,
-                            reraise_as_library_errors=False,
-                        )
-                        channel = self.default_channel
-                        obj.revive(channel)
-                        if on_revive:
-                            on_revive(channel)
-                        got_connection += 1
-                    except chan_errors as exc:
-                        if max_retries is not None and retries > max_retries:
-                            raise
-                        self._debug('ensure channel error: %r',
-                                    exc, exc_info=1)
-                        errback and errback(exc, 0)
-        _ensured.__name__ = f'{fun.__name__}(ensured)'
-        _ensured.__doc__ = fun.__doc__
-        _ensured.__module__ = fun.__module__
-        return _ensured
+        return self._retry_orchestrator.ensure(
+            obj, fun, errback=errback, max_retries=max_retries,
+            interval_start=interval_start, interval_step=interval_step,
+            interval_max=interval_max, on_revive=on_revive,
+            retry_errors=retry_errors,
+        )
 
     def autoretry(self, fun, channel=None, **ensure_options):
         """Decorator for functions supporting a ``channel`` keyword argument.
