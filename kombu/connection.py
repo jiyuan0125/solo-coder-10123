@@ -40,7 +40,10 @@ if TYPE_CHECKING:
 
     from types import TracebackType
 
-__all__ = ('Connection', 'ConnectionPool', 'ChannelPool')
+__all__ = (
+    'Connection', 'ConnectionPool', 'ChannelPool',
+    'FailoverStrategyRegistry', 'failover_strategies',
+)
 
 logger = get_logger(__name__)
 
@@ -51,10 +54,67 @@ resolve_aliases = {
     'librabbitmq': 'amqp',
 }
 
-failover_strategies = {
+
+class FailoverStrategyRegistry(dict):
+    """可扩展的故障转移策略注册表。
+
+    继承自 dict 以保持向后兼容性——第三方代码仍然可以
+    直接通过字典接口添加/修改策略。
+
+    同时提供更正式的 register/unregister 接口。
+    """
+
+    def register(self, name, strategy):
+        """注册一个故障转移策略。
+
+        Arguments:
+            name (str): 策略名称。
+            strategy (callable): 策略函数，接受一个列表参数，
+                返回一个迭代器。
+        """
+        self[name] = strategy
+        return strategy
+
+    def unregister(self, name):
+        """注销一个故障转移策略。
+
+        Arguments:
+            name (str): 策略名称。
+
+        Returns:
+            callable: 被注销的策略函数。
+
+        Raises:
+            KeyError: 如果策略不存在。
+        """
+        return self.pop(name)
+
+    def get_strategy(self, name_or_strategy):
+        """获取策略函数。
+
+        Arguments:
+            name_or_strategy: 策略名称（字符串）或策略函数本身。
+
+        Returns:
+            callable: 策略函数。
+
+        Raises:
+            KeyError: 如果是字符串且在注册表中找不到。
+        """
+        if callable(name_or_strategy):
+            return name_or_strategy
+        if name_or_strategy in self:
+            return self[name_or_strategy]
+        raise KeyError(
+            f"Unknown failover strategy: {name_or_strategy!r}. "
+            f"Available strategies: {list(self.keys())}"
+        )
+
+
+failover_strategies = FailoverStrategyRegistry({
     'round-robin': roundrobin_failover,
     'shuffle': shufflecycle,
-}
+})
 
 _log_connection = os.environ.get('KOMBU_LOG_CONNECTION', False)
 _log_channel = os.environ.get('KOMBU_LOG_CHANNEL', False)

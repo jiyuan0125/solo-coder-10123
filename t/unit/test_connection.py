@@ -8,7 +8,9 @@ from unittest.mock import Mock, patch
 import pytest
 
 from kombu import Connection, Consumer, Producer, parse_url
-from kombu.connection import Resource
+from kombu.connection import (
+    Resource, FailoverStrategyRegistry, failover_strategies,
+)
 from kombu.exceptions import OperationalError
 from kombu.utils.functional import lazy
 from t.mocks import TimeoutingTransport, Transport
@@ -837,6 +839,138 @@ class test_Connection:
                 conn.default_channel
 
         callback.assert_called()
+
+
+class test_FailoverStrategyRegistry:
+
+    def test_registry_is_dict_subclass(self):
+        """FailoverStrategyRegistry 是 dict 的子类，保持向后兼容。"""
+        assert isinstance(failover_strategies, dict)
+        assert isinstance(failover_strategies, FailoverStrategyRegistry)
+
+    def test_default_strategies_exist(self):
+        """默认的 round-robin 和 shuffle 策略应该存在。"""
+        assert 'round-robin' in failover_strategies
+        assert 'shuffle' in failover_strategies
+        assert callable(failover_strategies['round-robin'])
+        assert callable(failover_strategies['shuffle'])
+
+    def test_register_strategy(self):
+        """register 方法可以注册新策略。"""
+        registry = FailoverStrategyRegistry()
+
+        def my_strategy(alt):
+            return iter(alt)
+
+        result = registry.register('my-strategy', my_strategy)
+        assert result is my_strategy
+        assert 'my-strategy' in registry
+        assert registry['my-strategy'] is my_strategy
+
+    def test_unregister_strategy(self):
+        """unregister 方法可以注销策略。"""
+        registry = FailoverStrategyRegistry({'test': lambda x: iter(x)})
+
+        result = registry.unregister('test')
+        assert callable(result)
+        assert 'test' not in registry
+
+    def test_unregister_nonexistent_raises(self):
+        """注销不存在的策略应该抛 KeyError。"""
+        registry = FailoverStrategyRegistry()
+        with pytest.raises(KeyError):
+            registry.unregister('nonexistent')
+
+    def test_get_strategy_with_name(self):
+        """get_strategy 用名字能找到策略。"""
+        registry = FailoverStrategyRegistry({'foo': lambda x: iter(x)})
+        strategy = registry.get_strategy('foo')
+        assert callable(strategy)
+
+    def test_get_strategy_with_callable(self):
+        """get_strategy 直接传入 callable 会直接返回。"""
+        registry = FailoverStrategyRegistry()
+
+        def my_strat(alt):
+            return iter(alt)
+
+        result = registry.get_strategy(my_strat)
+        assert result is my_strat
+
+    def test_get_strategy_unknown_raises(self):
+        """get_strategy 找不到名字时抛 KeyError，不静默退化。"""
+        registry = FailoverStrategyRegistry()
+        with pytest.raises(KeyError) as exc_info:
+            registry.get_strategy('unknown-strategy')
+        assert 'unknown-strategy' in str(exc_info.value)
+
+    def test_dict_style_assignment_backward_compatible(self):
+        """第三方代码直接用字典方式添加策略仍然有效。"""
+        registry = FailoverStrategyRegistry()
+
+        def custom_strategy(alt):
+            return iter(alt)
+
+        # 模拟第三方代码直接往字典里塞
+        registry['custom-strategy'] = custom_strategy
+
+        # 应该能找到
+        assert 'custom-strategy' in registry
+        assert registry['custom-strategy'] is custom_strategy
+
+    def test_module_level_and_class_attribute_same_object(self):
+        """模块级 failover_strategies 和 Connection.failover_strategies 是同一个对象。"""
+        assert Connection.failover_strategies is failover_strategies
+
+    def test_custom_strategy_via_dict_works_in_connection(self):
+        """通过字典接口添加的自定义策略可以被 Connection 使用。"""
+        # 先保存原来的
+        original_strategies = dict(failover_strategies)
+        try:
+            call_count = [0]
+
+            def my_strategy(alt):
+                call_count[0] += 1
+                return iter(alt)
+
+            # 模拟第三方代码直接往字典里加
+            failover_strategies['my-custom-strategy'] = my_strategy
+
+            # Connection 应该能找到这个策略
+            conn = Connection(
+                'amqp://host1;amqp://host2',
+                failover_strategy='my-custom-strategy',
+                transport=Transport,
+            )
+            assert callable(conn.failover_strategy)
+            assert conn._failover_strategy == 'my-custom-strategy'
+        finally:
+            # 恢复
+            failover_strategies.clear()
+            failover_strategies.update(original_strategies)
+
+    def test_pickle_uses_strategy_name_not_instance(self):
+        """pickle 序列化只保存策略名字，不保存策略实例。"""
+        conn = Connection(
+            'amqp://A;amqp://B',
+            failover_strategy='round-robin',
+            transport=Transport,
+        )
+        info = conn.info()
+        # info 里存的是策略名字符串，不是策略对象
+        assert isinstance(info['failover_strategy'], str)
+        assert info['failover_strategy'] == 'round-robin'
+
+    def test_clone_preserves_strategy_name(self):
+        """clone 出来的连接保持策略名字。"""
+        conn = Connection(
+            'amqp://A;amqp://B',
+            failover_strategy='shuffle',
+            transport=Transport,
+        )
+        cloned = conn.clone()
+        assert cloned._failover_strategy == 'shuffle'
+        assert callable(cloned.failover_strategy)
 
 
 class test_Connection_callable_password:
